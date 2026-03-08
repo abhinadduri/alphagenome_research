@@ -76,6 +76,8 @@ BatchPrediction: TypeAlias = PyTree[
     Float[Array, 'B ...'] | Int32[Array, 'B ...']
 ]
 
+_MAX_CHUNKED_HOST_TRANSFER_BYTES = 256 * 1024 * 1024
+
 ApplyFn = Callable[
     [
         hk.Params,
@@ -281,6 +283,66 @@ def _upcast_single_batch_predictions(
   """Helper to upcast and optionally transfer predictions to host."""
   x = jax.tree.map(lambda x: tensor_utils.upcast_floating(x[0]), x)
   return jax.device_put(x, jax.memory.Space.Host) if transfer_to_host else x
+
+
+def _is_non_gpu_array(x: object) -> bool:
+  devices_fn = getattr(x, 'devices', None)
+  if not callable(devices_fn):
+    return False
+  try:
+    devices = devices_fn()
+  except Exception:
+    return False
+  return bool(devices) and all(device.platform != 'gpu' for device in devices)
+
+
+def _chunked_device_to_numpy(
+    x: PyTree[Array | np.ndarray | np.generic],
+    *,
+    max_chunk_bytes: int = _MAX_CHUNKED_HOST_TRANSFER_BYTES,
+) -> PyTree[np.ndarray | np.generic]:
+  """Transfers GPU-backed arrays to NumPy in chunks when needed.
+
+  Large `jax.device_get(...)` calls can fail on some H100 driver stacks because
+  XLA's host allocator uses `cudaHostRegister` for large pinned allocations.
+  Copying large arrays to the CPU device in <=256 MiB slices avoids that path
+  while preserving the fast single-call transfer for smaller arrays.
+  """
+
+  cpu_devices = tuple(jax.devices('cpu'))
+
+  def _to_numpy_leaf(leaf):
+    if isinstance(leaf, (np.ndarray, np.generic)):
+      return leaf
+    if not hasattr(leaf, 'shape') or not hasattr(leaf, 'dtype'):
+      return leaf
+    if _is_non_gpu_array(leaf):
+      return np.asarray(leaf)
+
+    shape = tuple(int(dim) for dim in leaf.shape)
+    dtype = np.dtype(leaf.dtype)
+    if not shape:
+      return np.asarray(jax.device_get(leaf))
+
+    nbytes = int(np.prod(shape, dtype=np.int64)) * dtype.itemsize
+    if nbytes <= max_chunk_bytes or not cpu_devices:
+      return np.asarray(jax.device_get(leaf))
+
+    row_elems = int(np.prod(shape[1:], dtype=np.int64)) if len(shape) > 1 else 1
+    row_bytes = max(1, row_elems * dtype.itemsize)
+    chunk_len = max(1, max_chunk_bytes // row_bytes)
+    result = np.empty(shape, dtype=dtype)
+
+    with jax.transfer_guard('allow'):
+      for start in range(0, shape[0], chunk_len):
+        size = min(chunk_len, shape[0] - start)
+        chunk = jax.lax.dynamic_slice_in_dim(leaf, start, size, axis=0)
+        cpu_chunk = jax.device_put(chunk, cpu_devices[0])
+        result[start : start + size] = np.asarray(cpu_chunk)
+
+    return result
+
+  return jax.tree.map(_to_numpy_leaf, x)
 
 
 @typing.jaxtyped
@@ -518,7 +580,9 @@ class AlphaGenomeModel(dna_model.DnaModel):
       predictions = _filter_predictions(
           predictions, track_masks=jax.device_put(track_masks, device)
       )
-      predictions = _upcast_single_batch_predictions(predictions)
+      predictions = _upcast_single_batch_predictions(
+          predictions, transfer_to_host=False
+      )
       return _construct_output_from_predictions(
           predictions,
           track_masks=track_masks,
@@ -568,7 +632,9 @@ class AlphaGenomeModel(dna_model.DnaModel):
       predictions = _filter_predictions(
           predictions, track_masks=jax.device_put(track_masks, device)
       )
-      predictions = _upcast_single_batch_predictions(predictions)
+      predictions = _upcast_single_batch_predictions(
+          predictions, transfer_to_host=False
+      )
       return _construct_output_from_predictions(
           predictions,
           track_masks=track_masks,
@@ -640,7 +706,8 @@ class AlphaGenomeModel(dna_model.DnaModel):
           track_masks=jax.device_put(track_masks, device),
       )
       reference_predictions, alt_predictions = _upcast_single_batch_predictions(
-          (reference_predictions, alt_predictions)
+          (reference_predictions, alt_predictions),
+          transfer_to_host=False,
       )
 
       return dna_output.VariantOutput(
@@ -729,7 +796,7 @@ class AlphaGenomeModel(dna_model.DnaModel):
             interval=interval,
         )
         result = scorer.finalize_interval(
-            jax.device_get(scores),
+            _chunked_device_to_numpy(scores),
             track_metadata=output_metadata,
             mask_metadata=metadata,
             settings=scorer_settings,
@@ -841,7 +908,7 @@ class AlphaGenomeModel(dna_model.DnaModel):
             interval=interval,
         )
         result = scorer.finalize_variant(
-            jax.device_get(scores),
+            _chunked_device_to_numpy(scores),
             track_metadata=output_metadata,
             mask_metadata=metadata,
             settings=scorer_settings,
@@ -934,7 +1001,7 @@ def _construct_output_from_predictions(
       # No tracks are predicted for this head.
       return None
     return track_data.TrackData(
-        values=jax.device_get(prediction),
+        values=_chunked_device_to_numpy(prediction),
         resolution=metadata.resolution(output_type),
         metadata=track_metadata[track_masks[output_type]],
         interval=interval,
@@ -952,8 +1019,8 @@ def _construct_output_from_predictions(
 
     junction_predictions, strands, starts, ends = (
         splice_junction.unstack_junction_predictions(
-            jax.device_get(splice_junctions),
-            jax.device_get(splice_site_positions),
+            _chunked_device_to_numpy(splice_junctions),
+            _chunked_device_to_numpy(splice_site_positions),
             interval,
         )
     )
